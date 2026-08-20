@@ -1,9 +1,22 @@
-# src/train.py
+"""Configuration-driven training with one reproducible directory per run."""
 
-import os
-import random
-import time
+from __future__ import annotations
+
+import argparse
 import csv
+import json
+import logging
+import os
+import platform
+import random
+import re
+import subprocess
+import sys
+import time
+from copy import deepcopy
+from datetime import datetime
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import torch
@@ -13,509 +26,626 @@ from dataset import get_dataloaders
 from model import CNNBaseline, ResNet18
 
 
-# ============================================================
-# Configuration
-# ============================================================
-
-SEED = 266978
-
-BATCH_SIZE = 128
-EPOCHS = 200
-
-LEARNING_RATE = 0.1
-MOMENTUM = 0.9
-WEIGHT_DECAY = 5e-4
-
-DATA_DIR = "../data/cifar-10-batches-py"
-
-CHECKPOINT_DIR = "../checkpoints"
-LOG_DIR = "../logs"
-
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-os.makedirs(LOG_DIR, exist_ok=True)
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+METRIC_FIELDS = [
+    "epoch",
+    "global_step",
+    "lr",
+    "train_loss",
+    "train_acc",
+    "val_loss",
+    "val_acc",
+    "epoch_time_s",
+    "elapsed_time_s",
+    "allocated_memory_mb",
+    "peak_memory_mb",
+]
 
 
-# CSV 文件
-CSV_PATH = os.path.join(
-    LOG_DIR,
-    "training_history.csv",
-)
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train one CIFAR-10 experiment and save it as an isolated run."
+    )
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--config", type=Path, help="JSON experiment config")
+    source.add_argument(
+        "--resume",
+        type=Path,
+        help="Path to an existing run's last_checkpoint.pt",
+    )
+    parser.add_argument("--seed", type=int, help="Override seed for a new run")
+    parser.add_argument("--epochs", type=int, help="Override epochs for a new run")
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cpu", "cuda", "mps"],
+        help="Override configured device",
+    )
+    parser.add_argument(
+        "--skip-test",
+        action="store_true",
+        help="Do not evaluate the test set at the end",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Validate config and model without creating a run",
+    )
+    return parser.parse_args()
 
 
-# ============================================================
-# Random Seed
-# ============================================================
+def read_json(path: Path) -> dict[str, Any]:
+    with path.open(encoding="utf-8") as stream:
+        return json.load(stream)
 
-def set_seed(seed):
+
+def atomic_write_json(path: Path, value: dict[str, Any]) -> None:
+    temp_path = path.with_name(f".{path.name}.tmp")
+    with temp_path.open("w", encoding="utf-8") as stream:
+        json.dump(value, stream, indent=2, ensure_ascii=False)
+        stream.write("\n")
+    os.replace(temp_path, path)
+
+
+def atomic_torch_save(value: dict[str, Any], path: Path) -> None:
+    temp_path = path.with_name(f".{path.name}.tmp")
+    torch.save(value, temp_path)
+    os.replace(temp_path, path)
+
+
+def torch_load(path: Path, device: torch.device) -> dict[str, Any]:
+    try:
+        return torch.load(path, map_location=device, weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location=device)
+
+
+def validate_config(config: dict[str, Any]) -> None:
+    required = ["experiment", "variant", "display_name", "seed"]
+    missing = [key for key in required if key not in config]
+    if missing:
+        raise ValueError(f"Missing config fields: {', '.join(missing)}")
+
+    if "model" not in config or "name" not in config["model"]:
+        raise ValueError("Config must contain model.name")
+    if config["model"]["name"] not in {"CNNBaseline", "ResNet18"}:
+        raise ValueError(f"Unsupported model: {config['model']['name']}")
+
+    training = config.get("training", {})
+    for key in ("epochs", "batch_size", "criterion", "optimizer", "scheduler"):
+        if key not in training:
+            raise ValueError(f"Config must contain training.{key}")
+    if int(training["epochs"]) <= 0 or int(training["batch_size"]) <= 0:
+        raise ValueError("training.epochs and training.batch_size must be positive")
+
+    data = config.get("data", {})
+    for key in ("data_dir", "val_ratio", "num_workers", "augmentation"):
+        if key not in data:
+            raise ValueError(f"Config must contain data.{key}")
+
+
+def slugify(value: str) -> str:
+    value = re.sub(r"[^a-zA-Z0-9_-]+", "-", value.strip()).strip("-_")
+    return value.lower() or "run"
+
+
+def unique_run_dir(config: dict[str, Any]) -> tuple[str, Path]:
+    timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    stem = "_".join(
+        [
+            timestamp,
+            slugify(str(config["experiment"])),
+            slugify(str(config["variant"])),
+            f"s{config['seed']}",
+        ]
+    )
+    runs_dir = PROJECT_ROOT / config.get("output", {}).get("runs_dir", "runs")
+    candidate = runs_dir / stem
+    suffix = 1
+    while candidate.exists():
+        candidate = runs_dir / f"{stem}-{suffix:02d}"
+        suffix += 1
+    return candidate.name, candidate
+
+
+def git_metadata() -> dict[str, Any]:
+    def run_git(*args: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                cwd=PROJECT_ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            return result.stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            return None
+
+    status = run_git("status", "--porcelain")
+    return {
+        "commit": run_git("rev-parse", "HEAD"),
+        "dirty": bool(status) if status is not None else None,
+    }
+
+
+def environment_metadata(device: torch.device) -> dict[str, Any]:
+    return {
+        "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "project_root": str(PROJECT_ROOT),
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "torch": torch.__version__,
+        "device": str(device),
+        "git": git_metadata(),
+        "command": sys.argv,
+    }
+
+
+def set_seed(seed: int, deterministic: bool = False) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-
-
-# ============================================================
-# Device
-# ============================================================
-
-def get_device():
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
     if torch.cuda.is_available():
-        return torch.device("cuda")
-    return torch.device("cpu")
+        torch.cuda.manual_seed_all(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = deterministic
+        torch.backends.cudnn.benchmark = not deterministic
+    if deterministic:
+        torch.use_deterministic_algorithms(True, warn_only=True)
 
 
-# ============================================================
-# Train One Epoch
-# ============================================================
+def get_device(requested: str) -> torch.device:
+    if requested == "auto":
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if torch.backends.mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
+    if requested == "cuda" and not torch.cuda.is_available():
+        raise RuntimeError("CUDA was requested but is not available")
+    if requested == "mps" and not torch.backends.mps.is_available():
+        raise RuntimeError("MPS was requested but is not available")
+    return torch.device(requested)
 
-def train_one_epoch(
-    model,
-    loader,
-    criterion,
-    optimizer,
-    device,
-):
 
+def build_model(config: dict[str, Any]) -> nn.Module:
+    model_config = dict(config["model"])
+    name = model_config.pop("name")
+    if name == "CNNBaseline":
+        return CNNBaseline(**model_config)
+    if name == "ResNet18":
+        return ResNet18(**model_config)
+    raise ValueError(f"Unsupported model: {name}")
+
+
+def build_criterion(config: dict[str, Any]) -> nn.Module:
+    criterion_config = dict(config["training"]["criterion"])
+    name = criterion_config.pop("name").lower()
+    if name == "crossentropyloss":
+        return nn.CrossEntropyLoss(**criterion_config)
+    raise ValueError(f"Unsupported criterion: {name}")
+
+
+def build_optimizer(config: dict[str, Any], model: nn.Module):
+    optimizer_config = dict(config["training"]["optimizer"])
+    name = optimizer_config.pop("name").lower()
+    if name == "sgd":
+        return torch.optim.SGD(model.parameters(), **optimizer_config)
+    if name == "adamw":
+        return torch.optim.AdamW(model.parameters(), **optimizer_config)
+    raise ValueError(f"Unsupported optimizer: {name}")
+
+
+def build_scheduler(config: dict[str, Any], optimizer):
+    scheduler_config = dict(config["training"]["scheduler"])
+    name = scheduler_config.pop("name").lower()
+    if name in {"none", "constant"}:
+        return None
+    if name == "cosineannealinglr":
+        scheduler_config.setdefault("T_max", int(config["training"]["epochs"]))
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            **scheduler_config,
+        )
+    if name == "multisteplr":
+        return torch.optim.lr_scheduler.MultiStepLR(optimizer, **scheduler_config)
+    raise ValueError(f"Unsupported scheduler: {name}")
+
+
+def synchronize(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    elif device.type == "mps" and hasattr(torch.mps, "synchronize"):
+        torch.mps.synchronize()
+
+
+def reset_peak_memory(device: torch.device) -> None:
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
+
+
+def peak_memory_mb(device: torch.device) -> float | None:
+    if device.type == "cuda":
+        return torch.cuda.max_memory_allocated(device) / (1024**2)
+    return None
+
+
+def allocated_memory_mb(device: torch.device) -> float | None:
+    if device.type == "cuda":
+        return torch.cuda.memory_allocated(device) / (1024**2)
+    if device.type == "mps" and hasattr(torch.mps, "current_allocated_memory"):
+        return torch.mps.current_allocated_memory() / (1024**2)
+    return None
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device):
     model.train()
-
     total_loss = 0.0
     correct = 0
     total = 0
 
-    for x, y in loader:
-        x = x.to(device)
-        y = y.to(device)
-        
-        # forward
-        logits = model(x)
-        loss = criterion(logits, y)
-        
-        # backward
-        optimizer.zero_grad()
+    for inputs, targets in loader:
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(inputs)
+        loss = criterion(logits, targets)
         loss.backward()
         optimizer.step()
 
-        batch_size = x.size(0)
-        total_loss += (loss.item() * batch_size)
-        predictions = logits.argmax(dim=1)
-        correct += ((predictions == y).sum().item())
+        batch_size = inputs.size(0)
+        total_loss += loss.item() * batch_size
+        correct += (logits.argmax(dim=1) == targets).sum().item()
         total += batch_size
 
-    epoch_loss = total_loss / total
-    epoch_acc = correct / total
+    return total_loss / total, correct / total
 
-    return epoch_loss, epoch_acc
-
-
-# ============================================================
-# Validation / Test
-# ============================================================
 
 @torch.no_grad()
-def evaluate(
-    model,
-    loader,
-    criterion,
-    device,
-):
-
+def evaluate(model, loader, criterion, device):
     model.eval()
-
     total_loss = 0.0
     correct = 0
     total = 0
 
-    for x, y in loader:
-        x = x.to(device)
-        y = y.to(device)
+    for inputs, targets in loader:
+        inputs = inputs.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        logits = model(inputs)
+        loss = criterion(logits, targets)
 
-        # forward
-        logits = model(x)
-        loss = criterion(logits, y)
-
-        batch_size = x.size(0)
-        total_loss += (loss.item() * batch_size)
-        predictions = logits.argmax(dim=1)
-        correct += ((predictions == y).sum().item())
+        batch_size = inputs.size(0)
+        total_loss += loss.item() * batch_size
+        correct += (logits.argmax(dim=1) == targets).sum().item()
         total += batch_size
 
-    epoch_loss = total_loss / total
-    epoch_acc = correct / total
-
-    return epoch_loss, epoch_acc
+    return total_loss / total, correct / total
 
 
-# ============================================================
-# Save Checkpoint
-# ============================================================
+def make_logger(run_dir: Path) -> logging.Logger:
+    logger = logging.getLogger(run_dir.name)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    formatter = logging.Formatter("%(asctime)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+    for handler in (logging.StreamHandler(), logging.FileHandler(run_dir / "console.log")):
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+    return logger
 
-def save_checkpoint(
+
+def write_metric(path: Path, row: dict[str, Any], create: bool) -> None:
+    mode = "w" if create else "a"
+    with path.open(mode, newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=METRIC_FIELDS)
+        if create:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def load_previous_elapsed(metrics_path: Path) -> float:
+    if not metrics_path.exists():
+        return 0.0
+    with metrics_path.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    return float(rows[-1]["elapsed_time_s"]) if rows else 0.0
+
+
+def checkpoint_payload(
+    config,
     model,
     optimizer,
     scheduler,
     epoch,
+    global_step,
+    best_epoch,
     best_val_acc,
-    seed,
-    path,
 ):
-
-    checkpoint = {
+    return {
+        "run_id": config["run_id"],
+        "config": config,
         "epoch": epoch,
+        "global_step": global_step,
+        "best_epoch": best_epoch,
+        "best_val_acc": best_val_acc,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
-        "scheduler_state_dict": scheduler.state_dict(),
-        "best_val_acc": best_val_acc,
-        "seed": seed,
+        "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
     }
 
-    torch.save(checkpoint, path)
+
+def prepare_new_run(config: dict[str, Any]) -> tuple[dict[str, Any], Path]:
+    run_id, run_dir = unique_run_dir(config)
+    run_dir.mkdir(parents=True)
+    (run_dir / "checkpoints").mkdir()
+    (run_dir / "figures").mkdir()
+    config["run_id"] = run_id
+    return config, run_dir
 
 
-# ============================================================
-# Create CSV
-# ============================================================
+def run_experiment(
+    config: dict[str, Any],
+    run_dir: Path,
+    resume_path: Path | None = None,
+) -> dict[str, Any]:
+    device_name = config.get("runtime", {}).get("device", "auto")
+    device = get_device(device_name)
+    seed = int(config["seed"])
+    deterministic = bool(config.get("runtime", {}).get("deterministic", False))
+    set_seed(seed, deterministic)
 
-def create_csv():
-  
-    with open(CSV_PATH, "w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "model",
-            "epoch",
-            "train_loss",
-            "train_acc",
-            "val_loss",
-            "val_acc",
-        ])
-
-
-# ============================================================
-# Append One Epoch to CSV
-# ============================================================
-
-def log_to_csv(
-    model_name,
-    epoch,
-    train_loss,
-    train_acc,
-    val_loss,
-    val_acc,
-):
-
-    with open(CSV_PATH, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            model_name,
-            epoch,
-            train_loss,
-            train_acc,
-            val_loss,
-            val_acc,
-        ])
-
-
-# ============================================================
-# Train One Model
-# ============================================================
-
-def train_model(
-    model,
-    model_name,
-    train_loader,
-    val_loader,
-    test_loader,
-    device,
-):
-
-    print("\n")
-    print("=" * 70)
-    print(f"Training: {model_name}")
-    print("=" * 70)
-
-    model = model.to(device)
-    print(model)
-
-    num_parameters = sum(
-        p.numel()
-        for p in model.parameters()
-        if p.requires_grad
-    )
-    print(
-        f"\nTrainable parameters: "
-        f"{num_parameters:,}"
-    )
-    print(
-        f"Trainable parameters: "
-        f"{num_parameters / 1e6:.2f} M"
-    )
-
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.SGD(
-        model.parameters(),
-        lr=LEARNING_RATE,
-        momentum=MOMENTUM,
-        weight_decay=WEIGHT_DECAY,
-    )
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=EPOCHS,
-    )
-
-    checkpoint_path = os.path.join(
-        CHECKPOINT_DIR,
-        f"{model_name}_best.pt",
-    )
-
-    best_val_acc = 0.0
-    total_start_time = time.time()
-    print("\nStarting training...\n")
-
-    # ========================================================
-    # Epoch Loop
-    # ========================================================
-
-    for epoch in range(EPOCHS):
-        epoch_start_time = time.time()
-
-        train_loss, train_acc = train_one_epoch(
-            model=model,
-            loader=train_loader,
-            criterion=criterion,
-            optimizer=optimizer,
-            device=device,
-        )
-        val_loss, val_acc = evaluate(
-            model=model,
-            loader=val_loader,
-            criterion=criterion,
-            device=device,
-        )
-
-        scheduler.step()
-        current_lr = optimizer.param_groups[0]["lr"]
-        epoch_time = (time.time() - epoch_start_time)
-
-        log_to_csv(
-            model_name=model_name,
-            epoch=epoch + 1,
-            train_loss=train_loss,
-            train_acc=train_acc,
-            val_loss=val_loss,
-            val_acc=val_acc,
-        )
-
-        print(
-            f"Epoch [{epoch + 1:03d}/{EPOCHS}] "
-            f"| "
-            f"Train Loss: {train_loss:.4f} "
-            f"| "
-            f"Train Acc: {train_acc * 100:.2f}% "
-            f"| "
-            f"Val Loss: {val_loss:.4f} "
-            f"| "
-            f"Val Acc: {val_acc * 100:.2f}% "
-            f"| "
-            f"LR: {current_lr:.6f} "
-            f"| "
-            f"Time: {epoch_time:.2f}s"
-        )
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            save_checkpoint(
-                model=model,
-                optimizer=optimizer,
-                scheduler=scheduler,
-                epoch=epoch + 1,
-                best_val_acc=best_val_acc,
-                seed=SEED,
-                path=checkpoint_path,
-            )
-            print(
-                f"    -> Best checkpoint saved "
-                f"(Val Acc: "
-                f"{best_val_acc * 100:.2f}%)"
-            )
-
-    total_time = (time.time() - total_start_time)
-
-    print("\nLoading best checkpoint...")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    best_val_acc = checkpoint["best_val_acc"]
-    
-    test_loss, test_acc = evaluate(
-        model=model,
-        loader=test_loader,
-        criterion=criterion,
-        device=device,
-    )
-
-    print("\n")
-    print("-" * 70)
-    print(f"Final Results: {model_name}")
-    print("-" * 70)
-
-    print(
-        f"Best Val Accuracy: "
-        f"{best_val_acc * 100:.2f}%"
-    )
-    print(
-        f"Test Loss: "
-        f"{test_loss:.4f}"
-    )
-    print(
-        f"Test Accuracy: "
-        f"{test_acc * 100:.2f}%"
-    )
-    print(
-        f"Training Time: "
-        f"{total_time / 60:.2f} min"
-    )
-    print(
-        f"Checkpoint: "
-        f"{checkpoint_path}"
-    )
-    print("-" * 70)
-
-    return {
-        "model": model_name,
-        "best_val_acc": best_val_acc,
-        "test_loss": test_loss,
-        "test_acc": test_acc,
-        "training_time": total_time,
-        "num_parameters": num_parameters,
-    }
-
-def main():
-
-    set_seed(SEED)
-    device = get_device()
-    print("=" * 70)
-    print(f"Device: {device}")
-    if device.type == "mps":
-        print(
-            "Using Apple Silicon GPU "
-            "through MPS."
-        )
-    elif device.type == "cuda":
-        print(
-            f"CUDA GPU: "
-            f"{torch.cuda.get_device_name(0)}"
-        )
+    current_environment = environment_metadata(device)
+    if resume_path and "environment" in config:
+        config.setdefault("resume_history", []).append(current_environment)
     else:
-        print(
-            "WARNING: Using CPU."
+        config["environment"] = current_environment
+    atomic_write_json(run_dir / "config.json", config)
+    logger = make_logger(run_dir)
+    logger.info("Run: %s", config["run_id"])
+    logger.info("Config: %s", run_dir / "config.json")
+    logger.info("Device: %s", device)
+
+    summary_path = run_dir / "summary.json"
+    summary: dict[str, Any] = {
+        "run_id": config["run_id"],
+        "experiment": config["experiment"],
+        "variant": config["variant"],
+        "display_name": config["display_name"],
+        "seed": seed,
+        "status": "running",
+    }
+    atomic_write_json(summary_path, summary)
+
+    try:
+        data_config = config["data"]
+        data_dir = Path(data_config["data_dir"])
+        if not data_dir.is_absolute():
+            data_dir = PROJECT_ROOT / data_dir
+
+        train_loader, val_loader, test_loader = get_dataloaders(
+            data_dir=data_dir,
+            batch_size=int(config["training"]["batch_size"]),
+            val_ratio=float(data_config["val_ratio"]),
+            seed=seed,
+            num_workers=int(data_config["num_workers"]),
+            augmentation=data_config["augmentation"],
+            download=bool(data_config.get("download", True)),
+            pin_memory=bool(data_config.get("pin_memory", device.type == "cuda")),
         )
 
-    print("=" * 70)
-
-    train_loader, val_loader, test_loader = (
-        get_dataloaders(
-            data_dir=DATA_DIR,
-            batch_size=BATCH_SIZE,
-            val_ratio=0.1,
-            seed=SEED,
-            num_workers=0,
+        model = build_model(config).to(device)
+        num_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        criterion = build_criterion(config)
+        optimizer = build_optimizer(config, model)
+        scheduler = build_scheduler(config, optimizer)
+        logger.info("Model: %s", config["model"])
+        logger.info("Trainable parameters: %s (%.3f M)", num_parameters, num_parameters / 1e6)
+        logger.info(
+            "Samples: train=%s val=%s test=%s",
+            len(train_loader.dataset),
+            len(val_loader.dataset),
+            len(test_loader.dataset),
         )
-    )
 
-    print(
-        f"Train samples: "
-        f"{len(train_loader.dataset)}"
-    )
-    print(
-        f"Val samples:   "
-        f"{len(val_loader.dataset)}"
-    )
-    print(
-        f"Test samples:  "
-        f"{len(test_loader.dataset)}"
-    )
-    print(
-        f"Train batches: "
-        f"{len(train_loader)}"
-    )
-    print(
-        f"Val batches:   "
-        f"{len(val_loader)}"
-    )
-    print(
-        f"Test batches:  "
-        f"{len(test_loader)}"
-    )
+        metrics_path = run_dir / "metrics.csv"
+        start_epoch = 1
+        global_step = 0
+        best_epoch = 0
+        best_val_acc = float("-inf")
+        previous_elapsed = 0.0
 
-    create_csv()
-    print(
-        f"\nTraining history will be saved to:"
-        f"\n{CSV_PATH}"
-    )
-    
-    # CNNBaseline
-    set_seed(SEED)
-    baseline_model = CNNBaseline(
-        num_classes=10
-    )
-    baseline_result = train_model(
-        model=baseline_model,
-        model_name="CNNBaseline",
-        train_loader=train_loader,
-        val_loader=val_loader,
-        test_loader=test_loader,
-        device=device,
-    )
-    print("\n\n")
-    print("#" * 70)
-    print("# CNN Baseline finished.")
-    print("# Starting ResNet-18...")
-    print("#" * 70)
+        if resume_path:
+            state = torch_load(resume_path, device)
+            model.load_state_dict(state["model_state_dict"])
+            optimizer.load_state_dict(state["optimizer_state_dict"])
+            if scheduler and state.get("scheduler_state_dict"):
+                scheduler.load_state_dict(state["scheduler_state_dict"])
+            start_epoch = int(state["epoch"]) + 1
+            global_step = int(state["global_step"])
+            best_epoch = int(state["best_epoch"])
+            best_val_acc = float(state["best_val_acc"])
+            previous_elapsed = load_previous_elapsed(metrics_path)
+            logger.info("Resuming from epoch %s", start_epoch)
 
-    # ResNet18
-    set_seed(SEED)
-    resnet_model = ResNet18(
-        num_classes=10
-    )
-    resnet_result = train_model(
-        model=resnet_model,
-        model_name="ResNet18",
-        train_loader=train_loader,
-        val_loader=val_loader,
-        test_loader=test_loader,
-        device=device,
-    )
+        total_start = time.perf_counter()
+        epochs = int(config["training"]["epochs"])
+        checkpoint_every = int(config["training"].get("checkpoint_every", 1))
+        best_path = run_dir / "checkpoints" / "best_weights.pt"
+        last_path = run_dir / "checkpoints" / "last_checkpoint.pt"
 
-    # Comparison
-    print("\n\n")
-    print("=" * 70)
-    print("Overall Comparison")
-    print("=" * 70)
-    print(
-        f"{'Model':<15}"
-        f"{'Best Val Acc':>15}"
-        f"{'Test Acc':>15}"
-        f"{'Time(min)':>15}"
-        f"{'Params(M)':>15}"
-    )
-    print("-" * 70)
-    print(
-        f"{baseline_result['model']:<15}"
-        f"{baseline_result['best_val_acc'] * 100:>14.2f}%"
-        f"{baseline_result['test_acc'] * 100:>14.2f}%"
-        f"{baseline_result['training_time'] / 60:>15.2f}"
-        f"{baseline_result['num_parameters'] / 1e6:>15.2f}"
-    )
-    print(
-        f"{resnet_result['model']:<15}"
-        f"{resnet_result['best_val_acc'] * 100:>14.2f}%"
-        f"{resnet_result['test_acc'] * 100:>14.2f}%"
-        f"{resnet_result['training_time'] / 60:>15.2f}"
-        f"{resnet_result['num_parameters'] / 1e6:>15.2f}"
-    )
-    print("=" * 70)
-    print(
-        f"\nTraining history saved to:"
-        f"\n{CSV_PATH}"
-    )
+        if start_epoch > epochs:
+            raise ValueError(
+                f"Checkpoint is already at epoch {start_epoch - 1}, "
+                f"but config requests only {epochs} epochs"
+            )
+
+        for epoch in range(start_epoch, epochs + 1):
+            reset_peak_memory(device)
+            synchronize(device)
+            epoch_start = time.perf_counter()
+            epoch_lr = float(optimizer.param_groups[0]["lr"])
+
+            train_loss, train_acc = train_one_epoch(
+                model, train_loader, criterion, optimizer, device
+            )
+            val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+            synchronize(device)
+
+            epoch_time = time.perf_counter() - epoch_start
+            elapsed = previous_elapsed + (time.perf_counter() - total_start)
+            global_step += len(train_loader)
+
+            if val_acc > best_val_acc:
+                best_epoch = epoch
+                best_val_acc = val_acc
+                atomic_torch_save(
+                    {
+                        "run_id": config["run_id"],
+                        "config": config,
+                        "epoch": epoch,
+                        "best_val_acc": best_val_acc,
+                        "model_state_dict": model.state_dict(),
+                    },
+                    best_path,
+                )
+
+            if scheduler:
+                scheduler.step()
+
+            row = {
+                "epoch": epoch,
+                "global_step": global_step,
+                "lr": epoch_lr,
+                "train_loss": train_loss,
+                "train_acc": train_acc,
+                "val_loss": val_loss,
+                "val_acc": val_acc,
+                "epoch_time_s": epoch_time,
+                "elapsed_time_s": elapsed,
+                "allocated_memory_mb": allocated_memory_mb(device),
+                "peak_memory_mb": peak_memory_mb(device),
+            }
+            write_metric(metrics_path, row, create=epoch == 1 and not resume_path)
+
+            if epoch % checkpoint_every == 0 or epoch == epochs:
+                atomic_torch_save(
+                    checkpoint_payload(
+                        config,
+                        model,
+                        optimizer,
+                        scheduler,
+                        epoch,
+                        global_step,
+                        best_epoch,
+                        best_val_acc,
+                    ),
+                    last_path,
+                )
+
+            logger.info(
+                "Epoch %03d/%03d | train %.4f / %.2f%% | "
+                "val %.4f / %.2f%% | lr %.6f | %.1fs",
+                epoch,
+                epochs,
+                train_loss,
+                train_acc * 100,
+                val_loss,
+                val_acc * 100,
+                epoch_lr,
+                epoch_time,
+            )
+
+        total_time = previous_elapsed + (time.perf_counter() - total_start)
+        test_loss = None
+        test_acc = None
+        if config["training"].get("evaluate_test", True):
+            best_state = torch_load(best_path, device)
+            model.load_state_dict(best_state["model_state_dict"])
+            test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+
+        summary.update(
+            {
+                "status": "completed",
+                "model": config["model"]["name"],
+                "device": str(device),
+                "num_parameters": num_parameters,
+                "epochs": epochs,
+                "best_epoch": best_epoch,
+                "best_val_acc": best_val_acc,
+                "test_loss": test_loss,
+                "test_acc": test_acc,
+                "training_time_s": total_time,
+                "best_weights": str(best_path.relative_to(run_dir)),
+                "last_checkpoint": str(last_path.relative_to(run_dir)),
+                "completed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+        )
+        atomic_write_json(summary_path, summary)
+        logger.info("Completed | best val %.2f%% at epoch %s", best_val_acc * 100, best_epoch)
+        if test_acc is not None:
+            logger.info("Test accuracy: %.2f%%", test_acc * 100)
+        logger.info("Run directory: %s", run_dir)
+        return summary
+    except Exception as error:
+        summary.update(
+            {
+                "status": "failed",
+                "error": f"{type(error).__name__}: {error}",
+                "failed_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            }
+        )
+        atomic_write_json(summary_path, summary)
+        logger.exception("Run failed")
+        raise
+
+
+def load_requested_config(args: argparse.Namespace):
+    if args.resume:
+        resume_path = args.resume.expanduser().resolve()
+        run_dir = resume_path.parent.parent
+        config = read_json(run_dir / "config.json")
+        summary_path = run_dir / "summary.json"
+        previous_summary = read_json(summary_path) if summary_path.exists() else {}
+        if previous_summary.get("status") == "completed":
+            raise ValueError("This run is already completed and should not be resumed")
+        if args.seed is not None or args.epochs is not None:
+            raise ValueError("--seed and --epochs cannot be changed while resuming")
+        if args.device is not None:
+            config.setdefault("runtime", {})["device"] = args.device
+        if args.skip_test:
+            config["training"]["evaluate_test"] = False
+        return config, run_dir, resume_path
+
+    config = deepcopy(read_json(args.config.expanduser().resolve()))
+    if args.seed is not None:
+        config["seed"] = args.seed
+    if args.epochs is not None:
+        config["training"]["epochs"] = args.epochs
+    if args.device is not None:
+        config.setdefault("runtime", {})["device"] = args.device
+    if args.skip_test:
+        config["training"]["evaluate_test"] = False
+    validate_config(config)
+    if args.dry_run:
+        return config, None, None
+    config, run_dir = prepare_new_run(config)
+    return config, run_dir, None
+
+
+def main() -> None:
+    args = parse_args()
+    config, run_dir, resume_path = load_requested_config(args)
+    validate_config(config)
+
+    if args.dry_run:
+        model = build_model(config)
+        num_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(json.dumps(config, indent=2, ensure_ascii=False))
+        print(f"\nConfig is valid. Trainable parameters: {num_parameters:,}")
+        return
+
+    run_experiment(config, run_dir, resume_path)
+
 
 if __name__ == "__main__":
     main()
