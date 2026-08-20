@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from dataset import get_dataloaders
-from model import CNNBaseline
+from model import ResNet18
 
 SEED = 266978
 
@@ -22,7 +22,7 @@ DATA_DIR = "./data/cifar-10-batches-py"
 CHECKPOINT_DIR = "./checkpoints"
 CHECKPOINT_PATH = os.path.join(
     CHECKPOINT_DIR,
-    "CNNbaseline_best.pt",
+    "resnet18_best.pt",
 )
 os.makedirs(CHECKPOINT_DIR, exist_ok = True)
 
@@ -136,7 +136,7 @@ def main():
   print(f"Val batches:   {len(val_loader)}")
   print(f"Test batches:  {len(test_loader)}")
   
-  model = CNNBaseline(num_classes = 10)
+  model = ResNet18(num_classes = 10)
   model = model.to(device)
   print(model)
   
@@ -153,7 +153,7 @@ def main():
         f"Trainable parameters: "
         f"{num_parameters / 1e6:.2f} M"
     )
-  
+    
   criterion = nn.CrossEntropyLoss()
   
   optimizer = torch.optim.SGD(
@@ -227,13 +227,13 @@ def main():
     if val_acc > best_val_acc:
       best_val_acc = val_acc
       save_checkpoint(
-              model=model,
-              optimizer=optimizer,
-              scheduler=scheduler,
-              epoch=epoch+1,
-              best_val_acc=best_val_acc,
-              path=CHECKPOINT_PATH,
-            )
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        epoch=epoch+1,
+        best_val_acc=best_val_acc,
+        path=CHECKPOINT_PATH,
+      )
       print(
         f"  -> Saved best checkpoint "
         f"(Val Acc: {best_val_acc * 100:.2f}%)"
@@ -262,7 +262,7 @@ def main():
     print("\n==============================")
     print("Final Results")
     print("==============================")
-    print(f"Model: CNNBaseline")
+    print(f"Model: ResNet-18")
     print(
         f"Best Val Accuracy: "
         f"{best_val_acc * 100:.2f}%"
@@ -280,9 +280,9 @@ def main():
         f"{total_time / 60:.2f} min"
     )
     print(
-            f"Checkpoint: ",
-            f"{CHECKPOINT_PATH}"
-        )
+        f"Checkpoint: ",
+        f"{CHECKPOINT_PATH}"
+    )
     
 if __name__ == "__main__":
   main()
