@@ -1,0 +1,20 @@
+{
+  "run_id": "20260820-103331_model_comparison_resnet18_s266978",
+  "experiment": "model_comparison",
+  "variant": "resnet18",
+  "display_name": "ResNet18",
+  "seed": 266978,
+  "status": "completed",
+  "model": "ResNet18",
+  "device": "mps",
+  "num_parameters": 11173962,
+  "epochs": 200,
+  "best_epoch": 135,
+  "best_val_acc": 0.8908,
+  "test_loss": 0.37203386754989626,
+  "test_acc": 0.8899,
+  "training_time_s": 8375.799960082979,
+  "best_weights": "checkpoints/best_weights.pt",
+  "last_checkpoint": "checkpoints/last_checkpoint.pt",
+  "completed_at": "2026-08-20T12:53:10+08:00"
+}

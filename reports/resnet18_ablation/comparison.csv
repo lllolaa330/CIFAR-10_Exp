@@ -1,0 +1,9 @@
+run_id,experiment,variant,display_name,seed,model,base_channels,status,best_epoch,best_val_acc,test_acc,num_parameters,training_time_s
+20260820-174930_resnet18_ablation_w64_noaug_nodrop_s266978,resnet18_ablation,w64_noaug_nodrop,Reference: w64,266978,ResNet18,64,completed,135,0.8908,0.8899,11173962,8027.423871208011
+20260820-200323_resnet18_ablation_w64_noaug_drop03_s266978,resnet18_ablation,w64_noaug_drop03,+ Dropout,266978,ResNet18,64,completed,187,0.888,0.8926,11173962,8219.771669875016
+20260820-222029_resnet18_ablation_w64_cropflip_nodrop_s266978,resnet18_ablation,w64_cropflip_nodrop,+ Crop/Flip,266978,ResNet18,64,completed,192,0.9518,0.9512,11173962,8137.959298291011
+20260821-003612_resnet18_ablation_w32_noaug_nodrop_s266978,resnet18_ablation,w32_noaug_nodrop,+ Width32,266978,ResNet18,32,completed,179,0.877,0.8815,2797610,2728.9490814169985
+20260821-012145_resnet18_ablation_w64_cropflip_drop03_s266978,resnet18_ablation,w64_cropflip_drop03,+ Dropout + Crop/Flip,266978,ResNet18,64,completed,194,0.9524,0.9496,11173962,7928.794334166974
+20260821-033359_resnet18_ablation_w32_noaug_drop03_s266978,resnet18_ablation,w32_noaug_drop03,+ Dropout + Width32,266978,ResNet18,32,completed,179,0.8844,0.8798,2797610,2761.446172999975
+20260821-042004_resnet18_ablation_w32_cropflip_nodrop_s266978,resnet18_ablation,w32_cropflip_nodrop,+ Crop/Flip + Width32,266978,ResNet18,32,completed,188,0.9464,0.9413,2797610,2952.699405250023
+20260821-050921_resnet18_ablation_w32_cropflip_drop03_s266978,resnet18_ablation,w32_cropflip_drop03,+ Dropout + Crop/Flip + Width32,266978,ResNet18,32,completed,193,0.9444,0.9426,2797610,2974.995436875033
